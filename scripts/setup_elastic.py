@@ -58,11 +58,6 @@ def create_index():
                 "drafted_action":{"type": "text"},
                 "routed_to":     {"type": "keyword"},
             }
-        },
-        "settings": {
-            "number_of_shards": 1,
-            "number_of_replicas": 0,
-            "refresh_interval": "5s"
         }
     }
     es.indices.create(index=INDEX, body=mapping)

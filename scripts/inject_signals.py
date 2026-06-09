@@ -67,8 +67,7 @@ def count_existing_demo_signals():
     resp = es.count(index=INDEX, body={
         "query": {"bool": {"must": [
             {"term":  {"venue": VENUE}},
-            {"term":  {"gate":  GATE}},
-            {"prefix":{"id":    "demo_"}}
+            {"term":  {"gate":  GATE}}
         ]}}
     })
     return resp["count"]
