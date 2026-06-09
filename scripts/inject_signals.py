@@ -67,7 +67,8 @@ def count_existing_demo_signals():
     resp = es.count(index=INDEX, body={
         "query": {"bool": {"must": [
             {"term":  {"venue": VENUE}},
-            {"term":  {"gate":  GATE}}
+            {"term":  {"gate":  GATE}},
+            {"prefix":{"id":    "demo_"}}
         ]}}
     })
     return resp["count"]
@@ -77,6 +78,15 @@ def inject_batch(batch_num):
     if not signals:
         print(f"Unknown batch: {batch_num}. Use 1, 2, or 3.")
         sys.exit(1)
+
+    # Warn if starting at batch 1 but old demo signals exist
+    if batch_num == 1:
+        existing = count_existing_demo_signals()
+        if existing > 0:
+            print(f"⚠ Warning: {existing} old demo signals found at {GATE}.")
+            print(f"  Run --reset first for a clean demo, or continue to add on top.")
+            print(f"  Continuing in 2 seconds...")
+            import time; time.sleep(2)
 
     now = datetime.now(timezone.utc).isoformat()
     for s in signals:
@@ -133,12 +143,43 @@ def inject_batch(batch_num):
         print(f"\n  🟡 P2 WATCH — Agent is monitoring, escalation drafted")
 
 def reset_demo():
-    """Call this before starting a fresh demo run"""
-    es.delete_by_query(index=INDEX, body={
-        "query": {"prefix": {"id": "demo_"}}
+    """Full demo reset — clears Elastic demo signals + MongoDB records + resets volunteers"""
+    from pymongo import MongoClient
+    mongo = MongoClient(os.getenv("MONGO_URI"))
+    db    = mongo[os.getenv("MONGO_DB", "fifa_incidents")]
+
+    # 1. Delete demo_ signals from Elastic
+    r1 = es.delete_by_query(index=INDEX, body={"query": {"prefix": {"id": "demo_"}}})
+    print(f"  Elastic: removed {r1.get('deleted', 0)} demo signals")
+
+    # 2. Reset awaiting_approval + resolved signals back to open
+    r2 = es.update_by_query(index=INDEX, body={
+        "script": {
+            "source": "ctx._source.status = 'open'; ctx._source.remove('cluster_id'); ctx._source.remove('drafted_action'); ctx._source.remove('routed_to');",
+            "lang": "painless"
+        },
+        "query": {"terms": {"status": ["awaiting_approval", "resolved"]}}
     })
+    print(f"  Elastic: reset {r2.get('updated', 0)} signals to open")
     es.indices.refresh(index=INDEX)
-    print("✓ Demo signals cleared — ready for fresh run")
+
+    # 3. Clear incident_log
+    r3 = db.incident_log.delete_many({})
+    print(f"  MongoDB: cleared {r3.deleted_count} incident_log records")
+
+    # 4. Clear audit_log
+    r4 = db.audit_log.delete_many({})
+    print(f"  MongoDB: cleared {r4.deleted_count} audit_log entries")
+
+    # 5. Reset dispatched volunteers to available
+    r5 = db.volunteers.update_many(
+        {"status": "dispatched"},
+        {"$set": {"status": "available", "assigned_incident": None}}
+    )
+    print(f"  MongoDB: reset {r5.modified_count} dispatched volunteers → available")
+
+    mongo.close()
+    print("\n✅ Full reset complete — UI shows clean state (58 signals)")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="FIFA Incident Demo Signal Injector")
