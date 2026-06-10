@@ -9,12 +9,8 @@ from elasticsearch import Elasticsearch
 from pymongo import MongoClient
 from dotenv import load_dotenv
 
-# OpenTelemetry for Arize Phoenix
-import opentelemetry.trace as otel_trace
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-from opentelemetry.sdk.resources import Resource
+# Arize Phoenix via phoenix.otel
+from phoenix.otel import register as phoenix_register
 
 load_dotenv()
 
@@ -35,55 +31,60 @@ def audit(incident_id, action_type, actor, details, status=None):
         "status":      status
     })
 
-# ── Arize Phoenix via OpenTelemetry OTLP ─────────────────────────────────────
-def _setup_phoenix_tracer():
+# ── Arize Phoenix via phoenix.otel ────────────────────────────────────────────
+_tracer   = None
+_tp       = None
+
+def _setup_phoenix():
     space   = os.getenv("ARIZE_SPACE_KEY", "")
     api_key = os.getenv("ARIZE_API_KEY", "")
     if not space or not api_key:
         print("⚠ Phoenix: ARIZE_SPACE_KEY or ARIZE_API_KEY not set")
-        return None
-    endpoint = f"https://app.phoenix.arize.com/s/{space}/v1/traces"
-    exporter = OTLPSpanExporter(
-        endpoint=endpoint,
-        headers={"api_key": api_key}
-    )
-    provider = TracerProvider(
-        resource=Resource({"service.name": "fifa-2026-ground-zero"})
-    )
-    provider.add_span_processor(BatchSpanProcessor(exporter))
-    otel_trace.set_tracer_provider(provider)
-    print(f"✓ Phoenix tracer → {endpoint}")
-    return otel_trace.get_tracer("fifa-agent")
+        return None, None
+    try:
+        tp = phoenix_register(
+            project_name="fifa-2026-ground-zero",
+            api_key=api_key,
+            endpoint=f"https://app.phoenix.arize.com/s/{space}/v1/traces",
+            set_global_tracer_provider=False,
+            batch=True,
+        )
+        tracer = tp.get_tracer("fifa-agent")
+        print(f"✓ Arize Phoenix ready → project: fifa-2026-ground-zero")
+        return tp, tracer
+    except Exception as e:
+        print(f"⚠ Phoenix setup failed: {e}")
+        return None, None
 
-_tracer = None
 try:
-    _tracer = _setup_phoenix_tracer()
+    _tp, _tracer = _setup_phoenix()
 except Exception as e:
-    print(f"⚠ Phoenix setup failed: {e}")
+    print(f"⚠ Phoenix init error: {e}")
 
 def log_to_phoenix(incident, routing_rule, drafted_action, volunteer, confidence):
-    """Log agent decision as OpenTelemetry span to Arize Phoenix Cloud"""
+    """Log agent decision as span to Arize Phoenix Cloud"""
     if not _tracer:
-        print("  ⚠ Phoenix tracer not available")
+        print("  ⚠ Phoenix tracer not available — skipping")
         return
     try:
         severity  = incident.get("severity", "P2")
         routed_to = routing_rule.get("p1_owner") if severity=="P1" else routing_rule.get("p2_owner","")
         with _tracer.start_as_current_span("fifa-incident-agent") as span:
-            span.set_attribute("openinference.span.kind",  "AGENT")
-            span.set_attribute("input.value",              incident.get("text",""))
-            span.set_attribute("output.value",             drafted_action)
-            span.set_attribute("incident.id",              incident.get("id",""))
-            span.set_attribute("incident.venue",           incident.get("venue",""))
-            span.set_attribute("incident.gate",            incident.get("gate",""))
-            span.set_attribute("incident.type",            incident.get("type",""))
-            span.set_attribute("incident.severity",        severity)
-            span.set_attribute("incident.signal_count",    incident.get("signal_count",1))
-            span.set_attribute("agent.routed_to",          routed_to)
-            span.set_attribute("agent.confidence",         confidence)
-            span.set_attribute("agent.model",              "gemini-agent-v1")
-            span.set_attribute("agent.volunteer",          volunteer.get("name") if volunteer else "none")
-        print(f"  ✓ Phoenix span sent for {severity} {incident.get('type')}")
+            span.set_attribute("openinference.span.kind", "AGENT")
+            span.set_attribute("input.value",             incident.get("latest_text", incident.get("text","")))
+            span.set_attribute("output.value",            drafted_action)
+            span.set_attribute("incident.venue",          incident.get("venue",""))
+            span.set_attribute("incident.gate",           incident.get("gate",""))
+            span.set_attribute("incident.type",           incident.get("type",""))
+            span.set_attribute("incident.severity",       severity)
+            span.set_attribute("incident.signal_count",   incident.get("signal_count",1))
+            span.set_attribute("agent.routed_to",         routed_to)
+            span.set_attribute("agent.confidence",        confidence)
+            span.set_attribute("agent.model",             "gemini-agent-v1")
+            span.set_attribute("agent.volunteer",         volunteer.get("name") if volunteer else "none")
+        if _tp:
+            _tp.force_flush()
+        print(f"  ✓ Phoenix span sent → {severity} {incident.get('type')}")
     except Exception as e:
         print(f"  ⚠ Phoenix span failed: {e}")
 
